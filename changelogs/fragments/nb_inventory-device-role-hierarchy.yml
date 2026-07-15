@@ -1,0 +1,8 @@
+---
+bugfixes:
+  - >-
+    nb_inventory - device role groups (``role``/``device_roles``) are now nested
+    according to each device role's parent role, matching NetBox's device role
+    hierarchy (added in NetBox 4.3). Previously a host was only placed in its own
+    leaf role group, so grouping or targeting a parent role (e.g. ``role_router``)
+    silently missed hosts assigned to its child roles (e.g. ``role_access_router``).
