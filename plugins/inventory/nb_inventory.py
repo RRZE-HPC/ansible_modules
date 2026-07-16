@@ -146,6 +146,7 @@ DOCUMENTATION = """
                 - Keys used to create groups. The I(plurals) and I(racks) options control which of these are valid.
                 - I(rack_group) is supported on NetBox versions 2.10 or lower only
                 - I(location) is supported on NetBox versions 2.11 or higher only
+                - I(role)/I(device_roles) groups are nested according to the device role's parent role on NetBox versions 4.3 or higher, so a host is also considered a member of its role's ancestor role groups.
             type: list
             elements: str
             choices:
@@ -1285,6 +1286,16 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
             (device_role["id"], device_role["slug"]) for device_role in device_roles
         )
 
+        def get_device_role_parent(device_role):
+            try:
+                return (device_role["id"], device_role["parent"]["id"])
+            except (KeyError, TypeError):
+                return (device_role["id"], None)
+
+        # Dictionary of device role id to parent device role id
+        # The "parent" field was added to device roles in NetBox 4.3, making them hierarchical
+        self.device_role_parent_lookup = dict(map(get_device_role_parent, device_roles))
+
     def refresh_device_types_lookup(self):
         url = self.api_endpoint + "/api/dcim/device-types/?limit=0"
         device_types = self.get_resource_list(api_url=url)
@@ -1937,6 +1948,18 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
                 site_transformed_group_name, self.location_group_names[location_id]
             )
 
+    def _add_device_role_groups(self):
+        # Create a group for every device role, nested under its parent role
+        # if one is set (NetBox 4.3+ device role hierarchy). Hosts are
+        # already added to their own (leaf) role group by add_host_to_groups,
+        # so nesting the groups here is enough for a parent role's group to
+        # transitively contain the hosts of its child roles.
+        self._setup_nested_groups(
+            self._pluralize_group_by("role"),
+            self.device_roles_lookup,
+            self.device_role_parent_lookup,
+        )
+
     def _setup_nested_groups(self, group, lookup, parent_lookup):
         # Mapping of id to group name
         transformed_group_names = dict()
@@ -2084,6 +2107,10 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
         # Create groups for site_groups, containing the site groups
         if "site_group" in self.group_by and self.api_version >= version.parse("2.11"):
             self._add_site_group_groups()
+
+        # Create groups for device roles, nested by parent role (NetBox 4.3+)
+        if self._pluralize_group_by("role") in self.group_by:
+            self._add_device_role_groups()
 
         for host in chain(self.devices_list, self.vms_list):
             virtual_chassis_master = self._get_host_virtual_chassis_master(host)

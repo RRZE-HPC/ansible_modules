@@ -37,12 +37,25 @@ load_relative_test_data = partial(load_test_data, Path(__file__).resolve().paren
 class MockInventory:
     def __init__(self):
         self.variables = {}
+        self.groups = set()
+        self.children = {}
+        self.hosts = {}
 
     def set_variable(self, hostname, key, value):
         if hostname not in self.variables:
             self.variables[hostname] = {}
 
         self.variables[hostname][key] = value
+
+    def add_group(self, group):
+        self.groups.add(group)
+        return group
+
+    def add_child(self, parent, child):
+        self.children.setdefault(parent, set()).add(child)
+
+    def add_host(self, group, host):
+        self.hosts.setdefault(group, set()).add(host)
 
 
 @pytest.fixture
@@ -192,6 +205,74 @@ def test_group_extractors(
 
     for key in not_expected:
         assert key not in expected
+
+
+def test_refresh_device_roles_lookup_parent(inventory_fixture):
+    # NetBox 4.3+ device roles may have a "parent" role, forming a hierarchy.
+    # Older NetBox versions don't return a "parent" key at all.
+    device_roles = [
+        {"id": 1, "slug": "router", "name": "Router"},
+        {"id": 2, "slug": "access-router", "name": "Access Router", "parent": {"id": 1}},
+        {"id": 3, "slug": "border-router", "name": "Border Router", "parent": {"id": 1}},
+        {"id": 4, "slug": "switch", "name": "Switch", "parent": None},
+    ]
+
+    inventory_fixture.get_resource_list = Mock(return_value=device_roles)
+    inventory_fixture.refresh_device_roles_lookup()
+
+    assert inventory_fixture.device_roles_lookup == {
+        1: "router",
+        2: "access-router",
+        3: "border-router",
+        4: "switch",
+    }
+    assert inventory_fixture.device_role_parent_lookup == {
+        1: None,
+        2: 1,
+        3: 1,
+        4: None,
+    }
+
+
+def test_add_device_role_groups_nests_by_parent(inventory_fixture):
+    inventory_fixture.plurals = True
+    inventory_fixture.group_names_raw = False
+    inventory_fixture.device_roles_lookup = {
+        1: "router",
+        2: "access-router",
+        3: "border-router",
+    }
+    inventory_fixture.device_role_parent_lookup = {1: None, 2: 1, 3: 1}
+
+    inventory_fixture._add_device_role_groups()
+
+    assert inventory_fixture.inventory.groups == {
+        "device_roles_router",
+        "device_roles_access-router",
+        "device_roles_border-router",
+    }
+    assert inventory_fixture.inventory.children["device_roles_router"] == {
+        "device_roles_access-router",
+        "device_roles_border-router",
+    }
+
+    # A host with the leaf role "access-router" should be filed under that
+    # group; nesting makes it transitively part of "device_roles_router" too.
+    inventory_fixture.group_by = ["device_roles"]
+    inventory_fixture.racks = False
+    inventory_fixture.services = False
+    inventory_fixture.virtual_disks = False
+    inventory_fixture.interfaces = False
+    inventory_fixture.dns_name = False
+    inventory_fixture.ansible_host_dns_name = False
+
+    inventory_fixture.add_host_to_groups(
+        host={"id": 100, "role": {"id": 2}}, hostname="router1"
+    )
+
+    assert inventory_fixture.inventory.hosts == {
+        "device_roles_access-router": {"router1"}
+    }
 
 
 @pytest.mark.parametrize(
