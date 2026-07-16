@@ -275,6 +275,72 @@ def test_add_device_role_groups_nests_by_parent(inventory_fixture):
     }
 
 
+def test_refresh_platforms_lookup_parent(inventory_fixture):
+    # NetBox 4.4+ platforms may have a "parent" platform, forming a hierarchy.
+    # Older NetBox versions don't return a "parent" key at all.
+    platforms = [
+        {"id": 1, "slug": "linux", "name": "Linux"},
+        {"id": 2, "slug": "debian", "name": "Debian", "parent": {"id": 1}},
+        {"id": 3, "slug": "rhel", "name": "RHEL", "parent": {"id": 1}},
+        {"id": 4, "slug": "windows", "name": "Windows", "parent": None},
+    ]
+
+    inventory_fixture.get_resource_list = Mock(return_value=platforms)
+    inventory_fixture.refresh_platforms_lookup()
+
+    assert inventory_fixture.platforms_lookup == {
+        1: "linux",
+        2: "debian",
+        3: "rhel",
+        4: "windows",
+    }
+    assert inventory_fixture.platform_parent_lookup == {
+        1: None,
+        2: 1,
+        3: 1,
+        4: None,
+    }
+
+
+def test_add_platform_groups_nests_by_parent(inventory_fixture):
+    inventory_fixture.plurals = True
+    inventory_fixture.group_names_raw = False
+    inventory_fixture.platforms_lookup = {
+        1: "linux",
+        2: "debian",
+        3: "rhel",
+    }
+    inventory_fixture.platform_parent_lookup = {1: None, 2: 1, 3: 1}
+
+    inventory_fixture._add_platform_groups()
+
+    assert inventory_fixture.inventory.groups == {
+        "platforms_linux",
+        "platforms_debian",
+        "platforms_rhel",
+    }
+    assert inventory_fixture.inventory.children["platforms_linux"] == {
+        "platforms_debian",
+        "platforms_rhel",
+    }
+
+    # A host with the leaf platform "debian" should be filed under that
+    # group; nesting makes it transitively part of "platforms_linux" too.
+    inventory_fixture.group_by = ["platforms"]
+    inventory_fixture.racks = False
+    inventory_fixture.services = False
+    inventory_fixture.virtual_disks = False
+    inventory_fixture.interfaces = False
+    inventory_fixture.dns_name = False
+    inventory_fixture.ansible_host_dns_name = False
+
+    inventory_fixture.add_host_to_groups(
+        host={"id": 100, "platform": {"id": 2}}, hostname="server1"
+    )
+
+    assert inventory_fixture.inventory.hosts == {"platforms_debian": {"server1"}}
+
+
 @pytest.mark.parametrize(
     "api_url, max_uri_length, query_key, query_values, expected",
     load_relative_test_data("get_resource_list_chunked"),

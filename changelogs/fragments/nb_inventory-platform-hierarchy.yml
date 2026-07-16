@@ -1,0 +1,9 @@
+---
+bugfixes:
+  - >-
+    nb_inventory - platform groups (``platform``/``platforms``) are now nested
+    according to each platform's parent platform, matching NetBox's platform
+    hierarchy (added in NetBox 4.4). Previously a host was only placed in its own
+    leaf platform group, so grouping or targeting a parent platform (e.g.
+    ``platform_linux``) silently missed hosts assigned to its child platforms
+    (e.g. ``platform_debian``).

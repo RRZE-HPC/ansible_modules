@@ -147,6 +147,7 @@ DOCUMENTATION = """
                 - I(rack_group) is supported on NetBox versions 2.10 or lower only
                 - I(location) is supported on NetBox versions 2.11 or higher only
                 - I(role)/I(device_roles) groups are nested according to the device role's parent role on NetBox versions 4.3 or higher, so a host is also considered a member of its role's ancestor role groups.
+                - I(platform)/I(platforms) groups are nested according to the platform's parent platform on NetBox versions 4.4 or higher, so a host is also considered a member of its platform's ancestor platform groups.
             type: list
             elements: str
             choices:
@@ -1056,6 +1057,16 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
             (platform["id"], platform["slug"]) for platform in platforms
         )
 
+        def get_platform_parent(platform):
+            try:
+                return (platform["id"], platform["parent"]["id"])
+            except (KeyError, TypeError):
+                return (platform["id"], None)
+
+        # Dictionary of platform id to parent platform id
+        # The "parent" field was added to platforms in NetBox 4.4, making them hierarchical
+        self.platform_parent_lookup = dict(map(get_platform_parent, platforms))
+
     def refresh_sites_lookup(self):
         # Three dictionaries are created here.
         # "sites_lookup_slug" only contains the slug. Used by _add_site_groups() when creating inventory groups
@@ -1960,6 +1971,18 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
             self.device_role_parent_lookup,
         )
 
+    def _add_platform_groups(self):
+        # Create a group for every platform, nested under its parent platform
+        # if one is set (NetBox 4.4+ platform hierarchy). Hosts are already
+        # added to their own (leaf) platform group by add_host_to_groups, so
+        # nesting the groups here is enough for a parent platform's group to
+        # transitively contain the hosts of its child platforms.
+        self._setup_nested_groups(
+            self._pluralize_group_by("platform"),
+            self.platforms_lookup,
+            self.platform_parent_lookup,
+        )
+
     def _setup_nested_groups(self, group, lookup, parent_lookup):
         # Mapping of id to group name
         transformed_group_names = dict()
@@ -2111,6 +2134,10 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
         # Create groups for device roles, nested by parent role (NetBox 4.3+)
         if self._pluralize_group_by("role") in self.group_by:
             self._add_device_role_groups()
+
+        # Create groups for platforms, nested by parent platform (NetBox 4.4+)
+        if self._pluralize_group_by("platform") in self.group_by:
+            self._add_platform_groups()
 
         for host in chain(self.devices_list, self.vms_list):
             virtual_chassis_master = self._get_host_virtual_chassis_master(host)
