@@ -1,0 +1,13 @@
+---
+minor_changes:
+  - >-
+    nb_inventory - added a ``prefix``/``prefixes`` ``group_by`` option. A host is
+    placed in a group for the most specific NetBox IPAM prefix that contains each
+    of its addresses - at minimum its primary IPv4 and IPv6 addresses, and every
+    address on any of its interfaces when ``interfaces`` is also enabled - so a
+    host may belong to more than one leaf prefix group at once. Prefix groups are
+    nested according to prefix containment (computed from the prefixes' CIDRs,
+    since NetBox prefixes have no explicit parent field), so a host is also a
+    member of the groups for every less-specific prefix that contains a matched
+    address. VRFs are not taken into account when matching a host's address or
+    nesting prefixes.

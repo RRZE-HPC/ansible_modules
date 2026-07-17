@@ -148,6 +148,7 @@ DOCUMENTATION = """
                 - I(location) is supported on NetBox versions 2.11 or higher only
                 - I(role)/I(device_roles) groups are nested according to the device role's parent role on NetBox versions 4.3 or higher, so a host is also considered a member of its role's ancestor role groups.
                 - I(platform)/I(platforms) groups are nested according to the platform's parent platform on NetBox versions 4.4 or higher, so a host is also considered a member of its platform's ancestor platform groups.
+                - I(prefix)/I(prefixes) groups a host under the most specific NetBox IPAM prefix that contains each of its addresses. At minimum, its primary IPv4 and IPv6 addresses are checked; if I(interfaces) is also enabled, every address assigned to any of the host's interfaces is checked as well. A host may therefore belong to more than one leaf prefix group at once (for example, one per address family, or one per subnet it has an address in). These groups are nested by prefix containment (computed from the prefixes' CIDRs, since NetBox prefixes have no explicit parent field), so a host is also considered a member of the groups for every less-specific prefix that contains a matched address. VRFs are not taken into account, so overlapping prefixes defined in different VRFs are not distinguished.
             type: list
             elements: str
             choices:
@@ -172,6 +173,8 @@ DOCUMENTATION = """
                 - platform
                 - region
                 - site_group
+                - prefix
+                - prefixes
                 - cluster
                 - cluster_type
                 - cluster_group
@@ -397,7 +400,7 @@ from threading import Thread
 from typing import Iterable
 from itertools import chain
 from collections import defaultdict
-from ipaddress import ip_interface
+from ipaddress import ip_interface, ip_network
 
 
 from ansible.constants import DEFAULT_LOCAL_TMP
@@ -644,6 +647,13 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
                 }
             )
 
+        if self._pluralize_group_by("prefix") in getattr(self, "group_by", []):
+            extractors.update(
+                {
+                    self._pluralize_group_by("prefix"): self.extract_prefix,
+                }
+            )
+
         return extractors
 
     def _pluralize_group_by(self, group_by):
@@ -656,6 +666,7 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
             "platform": "platforms",
             "device_type": "device_types",
             "manufacturer": "manufacturers",
+            "prefix": "prefixes",
         }
 
         if self.plurals:
@@ -710,6 +721,45 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
             return self._pluralize(self.platforms_lookup[host["platform"]["id"]])
         except Exception:
             return
+
+    def extract_prefix(self, host):
+        # A host can have more than one address worth checking: its primary
+        # IPv4 and IPv6 addresses, and - if "interfaces" is enabled - every
+        # other address assigned to any of its interfaces. Each matches at
+        # most one (most specific) prefix, and a host may end up in more than
+        # one prefix's group, e.g. one for its IPv4 address and one for its
+        # IPv6 address, or one per subnet it has an address in.
+        groups = []
+        seen_groups = set()
+
+        def add_if_matches(address_string):
+            if not address_string:
+                return
+            try:
+                address = ip_interface(address_string).ip
+            except ValueError:
+                return
+
+            # self.prefixes_match_order is sorted by prefix length,
+            # descending, so the first match is the most specific
+            # (longest-prefix-match) prefix
+            for prefix_id, network in self.prefixes_match_order:
+                if address in network:
+                    group = self.prefixes_lookup[prefix_id]
+                    if group not in seen_groups:
+                        seen_groups.add(group)
+                        groups.append(group)
+                    return
+
+        add_if_matches(self.extract_primary_ip4(host))
+        add_if_matches(self.extract_primary_ip6(host))
+
+        if self.interfaces:
+            for interface in self.extract_interfaces(host) or []:
+                for ip_address_entry in interface.get("ip_addresses") or []:
+                    add_if_matches(ip_address_entry.get("address"))
+
+        return groups
 
     def extract_services(self, host):
         try:
@@ -1066,6 +1116,57 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
         # Dictionary of platform id to parent platform id
         # The "parent" field was added to platforms in NetBox 4.4, making them hierarchical
         self.platform_parent_lookup = dict(map(get_platform_parent, platforms))
+
+    def refresh_prefixes_lookup(self):
+        # Pull all prefixes defined in NetBox, to build a "prefix" group_by
+        # hierarchy. NetBox prefixes have no "slug" or "parent" field, so both
+        # the group name and the containment hierarchy are derived directly
+        # from each prefix's CIDR.
+        url = self.api_endpoint + "/api/ipam/prefixes/?limit=0"
+        prefixes = self.get_resource_list(api_url=url)
+
+        def make_group_name(prefix):
+            return (
+                prefix["prefix"].replace("/", "_").replace(".", "_").replace(":", "_")
+            )
+
+        self.prefixes_lookup = dict(
+            (prefix["id"], make_group_name(prefix)) for prefix in prefixes
+        )
+
+        networks = dict(
+            (prefix["id"], ip_network(prefix["prefix"], strict=False))
+            for prefix in prefixes
+        )
+
+        # Sorted with the most specific (largest prefixlen) network first, so
+        # extract_prefix() can find a host's most specific matching prefix by
+        # taking the first match.
+        self.prefixes_match_order = sorted(
+            networks.items(), key=lambda item: item[1].prefixlen, reverse=True
+        )
+
+        # Dictionary of prefix id to the id of the smallest prefix that
+        # contains it (of the same address family). This is O(n^2) in the
+        # number of prefixes, as NetBox does not expose containment directly.
+        self.prefix_parent_lookup = {}
+        for prefix_id, network in networks.items():
+            parent_id = None
+            parent_prefixlen = -1
+            for candidate_id, candidate_network in networks.items():
+                if candidate_id == prefix_id:
+                    continue
+                if candidate_network.version != network.version:
+                    continue
+                if candidate_network.prefixlen >= network.prefixlen:
+                    continue
+                if (
+                    network.subnet_of(candidate_network)
+                    and candidate_network.prefixlen > parent_prefixlen
+                ):
+                    parent_id = candidate_id
+                    parent_prefixlen = candidate_network.prefixlen
+            self.prefix_parent_lookup[prefix_id] = parent_id
 
     def refresh_sites_lookup(self):
         # Three dictionaries are created here.
@@ -1586,6 +1687,9 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
                 ]
             )
 
+        if self._pluralize_group_by("prefix") in self.group_by:
+            lookups.append(self.refresh_prefixes_lookup)
+
         return lookups
 
     @property
@@ -1983,6 +2087,20 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
             self.platform_parent_lookup,
         )
 
+    def _add_prefix_groups(self):
+        # Create a group for every prefix, nested under the smallest prefix
+        # that contains it (containment computed from the CIDRs, since NetBox
+        # prefixes have no explicit parent field). Hosts are already added to
+        # their own (most specific/leaf) prefix group by add_host_to_groups,
+        # so nesting the groups here is enough for a less-specific prefix's
+        # group to transitively contain the hosts of the prefixes nested
+        # inside it.
+        self._setup_nested_groups(
+            self._pluralize_group_by("prefix"),
+            self.prefixes_lookup,
+            self.prefix_parent_lookup,
+        )
+
     def _setup_nested_groups(self, group, lookup, parent_lookup):
         # Mapping of id to group name
         transformed_group_names = dict()
@@ -2138,6 +2256,10 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
         # Create groups for platforms, nested by parent platform (NetBox 4.4+)
         if self._pluralize_group_by("platform") in self.group_by:
             self._add_platform_groups()
+
+        # Create groups for prefixes, nested by prefix containment
+        if self._pluralize_group_by("prefix") in self.group_by:
+            self._add_prefix_groups()
 
         for host in chain(self.devices_list, self.vms_list):
             virtual_chassis_master = self._get_host_virtual_chassis_master(host)

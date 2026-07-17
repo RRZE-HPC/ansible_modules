@@ -341,6 +341,177 @@ def test_add_platform_groups_nests_by_parent(inventory_fixture):
     assert inventory_fixture.inventory.hosts == {"platforms_debian": {"server1"}}
 
 
+def test_group_extractors_includes_prefix_when_requested(inventory_fixture):
+    inventory_fixture.plurals = True
+    inventory_fixture.services = False
+    inventory_fixture.virtual_disks = False
+    inventory_fixture.interfaces = False
+    inventory_fixture.dns_name = False
+    inventory_fixture.ansible_host_dns_name = False
+    inventory_fixture.racks = False
+
+    inventory_fixture.group_by = []
+    assert "prefixes" not in inventory_fixture.group_extractors
+
+    inventory_fixture.group_by = ["prefixes"]
+    assert "prefixes" in inventory_fixture.group_extractors
+
+
+def test_refresh_prefixes_lookup_parent(inventory_fixture):
+    # NetBox prefixes have no explicit "parent" field (unlike device roles or
+    # platforms), so containment - and therefore the grouping hierarchy - has
+    # to be computed directly from the CIDRs.
+    prefixes = [
+        {"id": 1, "prefix": "10.0.0.0/8"},
+        {"id": 2, "prefix": "10.0.0.0/16"},
+        {"id": 3, "prefix": "10.0.10.0/24"},
+        {"id": 4, "prefix": "192.168.1.0/24"},
+    ]
+
+    inventory_fixture.get_resource_list = Mock(return_value=prefixes)
+    inventory_fixture.refresh_prefixes_lookup()
+
+    assert inventory_fixture.prefixes_lookup == {
+        1: "10_0_0_0_8",
+        2: "10_0_0_0_16",
+        3: "10_0_10_0_24",
+        4: "192_168_1_0_24",
+    }
+    assert inventory_fixture.prefix_parent_lookup == {
+        1: None,
+        2: 1,
+        3: 2,
+        4: None,
+    }
+
+
+def test_extract_prefix_matches_most_specific(inventory_fixture):
+    inventory_fixture.interfaces = False
+    inventory_fixture.get_resource_list = Mock(
+        return_value=[
+            {"id": 1, "prefix": "10.0.0.0/8"},
+            {"id": 2, "prefix": "10.0.0.0/16"},
+            {"id": 3, "prefix": "10.0.10.0/24"},
+        ]
+    )
+    inventory_fixture.refresh_prefixes_lookup()
+
+    host = {"primary_ip4": {"address": "10.0.10.5/24"}}
+    assert inventory_fixture.extract_prefix(host) == ["10_0_10_0_24"]
+
+    # An address outside of any known prefix should not match anything
+    assert (
+        inventory_fixture.extract_prefix({"primary_ip4": {"address": "172.16.0.1/24"}})
+        == []
+    )
+
+    # A host without a primary IP should not match anything either
+    assert inventory_fixture.extract_prefix({}) == []
+
+
+def test_extract_prefix_dual_stack_matches_both_families(inventory_fixture):
+    # A host with both a primary IPv4 and a primary IPv6 address should be
+    # grouped by both - not just the IPv4 one (NetBox's own "primary_ip"
+    # property prefers IPv4 whenever both are set, which would otherwise
+    # silently hide the IPv6 prefix membership).
+    inventory_fixture.interfaces = False
+    inventory_fixture.get_resource_list = Mock(
+        return_value=[
+            {"id": 1, "prefix": "10.0.10.0/24"},
+            {"id": 2, "prefix": "2001:db8::/32"},
+        ]
+    )
+    inventory_fixture.refresh_prefixes_lookup()
+
+    host = {
+        "primary_ip4": {"address": "10.0.10.5/24"},
+        "primary_ip6": {"address": "2001:db8::5/32"},
+    }
+
+    assert set(inventory_fixture.extract_prefix(host)) == {
+        "10_0_10_0_24",
+        "2001_db8___32",
+    }
+
+
+def test_extract_prefix_checks_all_interface_addresses(inventory_fixture):
+    # A single interface (or several) may carry more than one IPv4 address at
+    # once (secondary addresses, VIPs, etc). When "interfaces" is enabled,
+    # all of them should be checked, not just the device's primary address.
+    inventory_fixture.interfaces = True
+    inventory_fixture.get_resource_list = Mock(
+        return_value=[
+            {"id": 1, "prefix": "10.0.10.0/24"},
+            {"id": 2, "prefix": "10.0.20.0/24"},
+        ]
+    )
+    inventory_fixture.refresh_prefixes_lookup()
+
+    inventory_fixture.extract_interfaces = Mock(
+        return_value=[
+            {
+                "name": "eth0",
+                "ip_addresses": [
+                    {"address": "10.0.10.5/24"},
+                    {"address": "10.0.20.5/24"},
+                ],
+            }
+        ]
+    )
+
+    host = {"primary_ip4": {"address": "10.0.10.5/24"}}
+
+    assert set(inventory_fixture.extract_prefix(host)) == {
+        "10_0_10_0_24",
+        "10_0_20_0_24",
+    }
+
+
+def test_add_prefix_groups_nests_by_containment(inventory_fixture):
+    inventory_fixture.plurals = True
+    inventory_fixture.group_names_raw = False
+    inventory_fixture.get_resource_list = Mock(
+        return_value=[
+            {"id": 1, "prefix": "10.0.0.0/8"},
+            {"id": 2, "prefix": "10.0.0.0/16"},
+            {"id": 3, "prefix": "10.0.10.0/24"},
+        ]
+    )
+    inventory_fixture.refresh_prefixes_lookup()
+
+    inventory_fixture._add_prefix_groups()
+
+    assert inventory_fixture.inventory.groups == {
+        "prefixes_10_0_0_0_8",
+        "prefixes_10_0_0_0_16",
+        "prefixes_10_0_10_0_24",
+    }
+    assert inventory_fixture.inventory.children["prefixes_10_0_0_0_8"] == {
+        "prefixes_10_0_0_0_16",
+    }
+    assert inventory_fixture.inventory.children["prefixes_10_0_0_0_16"] == {
+        "prefixes_10_0_10_0_24",
+    }
+
+    # A host whose primary IP falls in the most specific prefix should be
+    # filed under that leaf group; nesting makes it transitively part of
+    # "prefixes_10_0_0_0_16" and "prefixes_10_0_0_0_8" too.
+    inventory_fixture.group_by = ["prefixes"]
+    inventory_fixture.racks = False
+    inventory_fixture.services = False
+    inventory_fixture.virtual_disks = False
+    inventory_fixture.interfaces = False
+    inventory_fixture.dns_name = False
+    inventory_fixture.ansible_host_dns_name = False
+
+    inventory_fixture.add_host_to_groups(
+        host={"id": 100, "primary_ip4": {"address": "10.0.10.5/24"}},
+        hostname="server1",
+    )
+
+    assert inventory_fixture.inventory.hosts == {"prefixes_10_0_10_0_24": {"server1"}}
+
+
 @pytest.mark.parametrize(
     "api_url, max_uri_length, query_key, query_values, expected",
     load_relative_test_data("get_resource_list_chunked"),
